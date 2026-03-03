@@ -493,6 +493,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
 #endif
     argsman.AddArg("-blockreconstructionextratxn=<n>", strprintf("Extra transactions to keep in memory for compact block reconstructions (default: %u)", DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-blocksonly", strprintf("Whether to reject transactions from network peers. Disables automatic broadcast and rebroadcast of transactions, unless the source peer has the 'forcerelay' permission. RPC transactions are not affected. (default: %u)", DEFAULT_BLOCKSONLY), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-headersonly", strprintf("Sync and maintain headers only (disables block body download and implies -blocksonly=1). (default: %u)", DEFAULT_HEADERSONLY), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-coinstatsindex", strprintf("Maintain coinstats index used by the gettxoutsetinfo RPC (default: %u)", DEFAULT_COINSTATSINDEX), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-conf=<file>", strprintf("Specify path to read-only configuration file. Relative paths will be prefixed by datadir location (only useable from command line, not configuration file) (default: %s)", BITCOIN_CONF_FILENAME), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-datadir=<dir>", "Specify data directory", ArgsManager::ALLOW_ANY | ArgsManager::DISALLOW_NEGATION, OptionsCategory::OPTIONS);
@@ -791,6 +792,12 @@ void InitParameterInteraction(ArgsManager& args)
         // if an explicit public IP is specified, do not try to find others
         if (args.SoftSetBoolArg("-discover", false))
             LogInfo("parameter interaction: -externalip set -> setting -discover=0\n");
+    }
+
+    if (args.GetBoolArg("-headersonly", DEFAULT_HEADERSONLY)) {
+        if (args.SoftSetBoolArg("-blocksonly", true)) {
+            LogInfo("parameter interaction: -headersonly=1 -> setting -blocksonly=1\n");
+        }
     }
 
     if (args.GetBoolArg("-blocksonly", DEFAULT_BLOCKSONLY)) {
@@ -1302,7 +1309,8 @@ static ChainstateLoadResult InitAndLoadChainstate(
     // dependency between validation and index/base, since the latter is not in
     // libbitcoinkernel.
     chainman.snapshot_download_completed = [&node]() {
-        if (!node.chainman->m_blockman.IsPruneMode()) {
+        const bool headers_only_mode = node.args != nullptr && node.args->GetBoolArg("-headersonly", DEFAULT_HEADERSONLY);
+        if (!headers_only_mode && !node.chainman->m_blockman.IsPruneMode()) {
             LogInfo("[snapshot] re-enabling NODE_NETWORK services");
             node.connman->AddLocalServices(NODE_NETWORK);
         }
@@ -1508,6 +1516,11 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 
     PeerManager::Options peerman_opts{};
     ApplyArgsManOptions(args, peerman_opts);
+    const bool headers_only_mode{peerman_opts.headers_only};
+    if (headers_only_mode) {
+        g_local_services = ServiceFlags(g_local_services & ~(NODE_NETWORK | NODE_NETWORK_LIMITED | NODE_COMPACT_FILTERS));
+        LogInfo("Running with -headersonly=1: disabling block-serving service flags");
+    }
 
     {
 
@@ -1837,6 +1850,8 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
                 chainstate->PruneAndFlush();
             }
         }
+    } else if (headers_only_mode) {
+        LogInfo("Running node in headers-only mode; keeping NODE_NETWORK services disabled");
     } else {
         // Prior to setting NODE_NETWORK, check if we can provide historical blocks.
         if (!WITH_LOCK(chainman.GetMutex(), return chainman.BackgroundSyncInProgress())) {

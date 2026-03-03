@@ -47,6 +47,7 @@
 #include <util/check.h>
 #include <util/fs.h>
 #include <util/strencodings.h>
+#include <util/time.h>
 #include <util/syserror.h>
 #include <util/translation.h>
 #include <validation.h>
@@ -118,6 +119,28 @@ static int ComputeNextBlockAndDepth(const CBlockIndex& tip, const CBlockIndex& b
     }
     next = nullptr;
     return &blockindex == &tip ? 1 : -1;
+}
+
+static bool IsHeadersOnlyMode(const JSONRPCRequest& request)
+{
+    const NodeContext& node = EnsureAnyNodeContext(request.context);
+    return node.args != nullptr && node.args->GetBoolArg("-headersonly", DEFAULT_HEADERSONLY);
+}
+
+static const CBlockIndex* GetRPCBestTip(const ChainstateManager& chainman, bool headers_only) EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+{
+    if (headers_only && chainman.m_best_header != nullptr) {
+        return chainman.m_best_header;
+    }
+    return chainman.ActiveChain().Tip();
+}
+
+static bool HeaderTipIsInitialSync(const ChainstateManager& chainman, const CBlockIndex& header_tip)
+{
+    const bool has_minimum_work{header_tip.nChainWork >= chainman.MinimumChainWork()};
+    const auto header_time{NodeSeconds{std::chrono::seconds{header_tip.GetBlockTime()}}};
+    const bool stale{header_time <= (NodeClock::now() - 24h)};
+    return !has_minimum_work || stale;
 }
 
 static const CBlockIndex* ParseHashOrHeight(const UniValue& param, ChainstateManager& chainman)
@@ -620,10 +643,11 @@ static RPCHelpMan getblockheader()
     const CBlockIndex* pblockindex;
     const CBlockIndex* tip;
     ChainstateManager& chainman = EnsureAnyChainman(request.context);
+    const bool headers_only{IsHeadersOnlyMode(request)};
     {
         LOCK(cs_main);
         pblockindex = chainman.m_blockman.LookupBlockIndex(hash);
-        tip = chainman.ActiveChain().Tip();
+        tip = GetRPCBestTip(chainman, headers_only);
     }
 
     if (!pblockindex) {
@@ -1375,24 +1399,26 @@ RPCHelpMan getblockchaininfo()
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
     ChainstateManager& chainman = EnsureAnyChainman(request.context);
+    const bool headers_only{IsHeadersOnlyMode(request)};
     LOCK(cs_main);
     Chainstate& active_chainstate = chainman.ActiveChainstate();
 
-    const CBlockIndex& tip{*CHECK_NONFATAL(active_chainstate.m_chain.Tip())};
-    const int height{tip.nHeight};
+    const CBlockIndex& active_tip{*CHECK_NONFATAL(active_chainstate.m_chain.Tip())};
+    const CBlockIndex& rpc_tip{*CHECK_NONFATAL(GetRPCBestTip(chainman, headers_only))};
+    const int height{headers_only ? rpc_tip.nHeight : active_tip.nHeight};
     UniValue obj(UniValue::VOBJ);
     obj.pushKV("chain", chainman.GetParams().GetChainTypeString());
     obj.pushKV("blocks", height);
     obj.pushKV("headers", chainman.m_best_header ? chainman.m_best_header->nHeight : -1);
-    obj.pushKV("bestblockhash", tip.GetBlockHash().GetHex());
-    obj.pushKV("bits", strprintf("%08x", tip.nBits));
-    obj.pushKV("target", GetTarget(tip, chainman.GetConsensus().powLimit).GetHex());
-    obj.pushKV("difficulty", GetDifficulty(tip));
-    obj.pushKV("time", tip.GetBlockTime());
-    obj.pushKV("mediantime", tip.GetMedianTimePast());
-    obj.pushKV("verificationprogress", chainman.GuessVerificationProgress(&tip));
-    obj.pushKV("initialblockdownload", chainman.IsInitialBlockDownload());
-    obj.pushKV("chainwork", tip.nChainWork.GetHex());
+    obj.pushKV("bestblockhash", rpc_tip.GetBlockHash().GetHex());
+    obj.pushKV("bits", strprintf("%08x", rpc_tip.nBits));
+    obj.pushKV("target", GetTarget(rpc_tip, chainman.GetConsensus().powLimit).GetHex());
+    obj.pushKV("difficulty", GetDifficulty(rpc_tip));
+    obj.pushKV("time", rpc_tip.GetBlockTime());
+    obj.pushKV("mediantime", rpc_tip.GetMedianTimePast());
+    obj.pushKV("verificationprogress", chainman.GuessVerificationProgress(&rpc_tip));
+    obj.pushKV("initialblockdownload", headers_only ? HeaderTipIsInitialSync(chainman, rpc_tip) : chainman.IsInitialBlockDownload());
+    obj.pushKV("chainwork", rpc_tip.nChainWork.GetHex());
     obj.pushKV("size_on_disk", chainman.m_blockman.CalculateCurrentUsage());
     obj.pushKV("pruned", chainman.m_blockman.IsPruneMode());
     if (chainman.m_blockman.IsPruneMode()) {
@@ -1544,35 +1570,56 @@ static RPCHelpMan getchaintips()
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
     ChainstateManager& chainman = EnsureAnyChainman(request.context);
+    const bool headers_only{IsHeadersOnlyMode(request)};
     LOCK(cs_main);
     CChain& active_chain = chainman.ActiveChain();
+    const CBlockIndex* reference_tip{headers_only ? CHECK_NONFATAL(GetRPCBestTip(chainman, /*headers_only=*/true)) : active_chain.Tip()};
 
-    /*
-     * Idea: The set of chain tips is the active chain tip, plus orphan blocks which do not have another orphan building off of them.
-     * Algorithm:
-     *  - Make one pass through BlockIndex(), picking out the orphan blocks, and also storing a set of the orphan block's pprev pointers.
-     *  - Iterate through the orphan blocks. If the block isn't pointed to by another orphan, it is a chain tip.
-     *  - Add the active chain tip
-     */
     std::set<const CBlockIndex*, CompareBlocksByHeight> setTips;
-    std::set<const CBlockIndex*> setOrphans;
-    std::set<const CBlockIndex*> setPrevs;
+    if (headers_only) {
+        /*
+         * In headers-only mode, use the set of all leaves in BlockIndex()
+         * relative to the selected header-chain reference tip.
+         */
+        std::set<const CBlockIndex*> setPrevs;
 
-    for (const auto& [_, block_index] : chainman.BlockIndex()) {
-        if (!active_chain.Contains(&block_index)) {
-            setOrphans.insert(&block_index);
-            setPrevs.insert(block_index.pprev);
+        for (const auto& [_, block_index] : chainman.BlockIndex()) {
+            if (block_index.pprev != nullptr) {
+                setPrevs.insert(block_index.pprev);
+            }
         }
-    }
 
-    for (std::set<const CBlockIndex*>::iterator it = setOrphans.begin(); it != setOrphans.end(); ++it) {
-        if (setPrevs.erase(*it) == 0) {
-            setTips.insert(*it);
+        for (const auto& [_, block_index] : chainman.BlockIndex()) {
+            if (!setPrevs.contains(&block_index)) {
+                setTips.insert(&block_index);
+            }
         }
-    }
 
-    // Always report the currently active tip.
-    setTips.insert(active_chain.Tip());
+        // Always report the selected reference tip.
+        setTips.insert(reference_tip);
+    } else {
+        /*
+         * Preserve existing non-headersonly behavior:
+         * active tip + orphan leaves.
+         */
+        std::set<const CBlockIndex*> setOrphans;
+        std::set<const CBlockIndex*> setPrevs;
+
+        for (const auto& [_, block_index] : chainman.BlockIndex()) {
+            if (!active_chain.Contains(&block_index)) {
+                setOrphans.insert(&block_index);
+                setPrevs.insert(block_index.pprev);
+            }
+        }
+
+        for (std::set<const CBlockIndex*>::iterator it = setOrphans.begin(); it != setOrphans.end(); ++it) {
+            if (setPrevs.erase(*it) == 0) {
+                setTips.insert(*it);
+            }
+        }
+
+        setTips.insert(active_chain.Tip());
+    }
 
     /* Construct the output array.  */
     UniValue res(UniValue::VARR);
@@ -1581,12 +1628,21 @@ static RPCHelpMan getchaintips()
         obj.pushKV("height", block->nHeight);
         obj.pushKV("hash", block->phashBlock->GetHex());
 
-        const int branchLen = block->nHeight - active_chain.FindFork(block)->nHeight;
+        int branchLen{0};
+        if (headers_only) {
+            const CBlockIndex* fork{LastCommonAncestor(block, reference_tip)};
+            branchLen = block->nHeight - (fork ? fork->nHeight : 0);
+        } else {
+            branchLen = block->nHeight - active_chain.FindFork(block)->nHeight;
+        }
         obj.pushKV("branchlen", branchLen);
 
         std::string status;
-        if (active_chain.Contains(block)) {
+        if (!headers_only && active_chain.Contains(block)) {
             // This block is part of the currently active chain.
+            status = "active";
+        } else if (headers_only && block == reference_tip) {
+            // This block is part of the selected header-chain reference tip.
             status = "active";
         } else if (block->nStatus & BLOCK_FAILED_MASK) {
             // This block or one of its ancestors is invalid.

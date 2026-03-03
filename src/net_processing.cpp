@@ -1842,6 +1842,7 @@ bool PeerManagerImpl::BlockRequestAllowed(const CBlockIndex* pindex)
 std::optional<std::string> PeerManagerImpl::FetchBlock(NodeId peer_id, const CBlockIndex& block_index)
 {
     if (m_chainman.m_blockman.LoadingBlocks()) return "Loading blocks ...";
+    if (m_opts.headers_only) return "Node is running in -headersonly mode";
 
     // Ensure this peer exists and hasn't been disconnected
     PeerRef peer = GetPeerRef(peer_id);
@@ -2706,6 +2707,8 @@ bool PeerManagerImpl::MaybeSendGetHeaders(CNode& pfrom, const CBlockLocator& loc
  */
 void PeerManagerImpl::HeadersDirectFetchBlocks(CNode& pfrom, const Peer& peer, const CBlockIndex& last_header)
 {
+    if (m_opts.headers_only) return;
+
     LOCK(cs_main);
     CNodeState *nodestate = State(pfrom.GetId());
 
@@ -4323,6 +4326,12 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
             return;
         }
 
+        if (m_opts.headers_only) {
+            CBlockHeaderAndShortTxIDs cmpctblock;
+            vRecv >> cmpctblock;
+            return ProcessHeadersMessage(pfrom, *peer, std::vector<CBlockHeader>{cmpctblock.header}, /*via_compact_block=*/true);
+        }
+
         CBlockHeaderAndShortTxIDs cmpctblock;
         vRecv >> cmpctblock;
 
@@ -4571,6 +4580,10 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
             return;
         }
 
+        if (m_opts.headers_only) {
+            return;
+        }
+
         BlockTransactions resp;
         vRecv >> resp;
 
@@ -4624,6 +4637,12 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
         if (m_chainman.m_blockman.LoadingBlocks()) {
             LogDebug(BCLog::NET, "Unexpected block message received from peer %d\n", pfrom.GetId());
             return;
+        }
+
+        if (m_opts.headers_only) {
+            CBlockHeader header;
+            vRecv >> header;
+            return ProcessHeadersMessage(pfrom, *peer, std::vector<CBlockHeader>{header}, /*via_compact_block=*/false);
         }
 
         std::shared_ptr<CBlock> pblock = std::make_shared<CBlock>();
@@ -5891,7 +5910,7 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
         // Message: getdata (blocks)
         //
         std::vector<CInv> vGetData;
-        if (CanServeBlocks(*peer) && ((sync_blocks_and_headers_from_peer && !IsLimitedPeer(*peer)) || !m_chainman.IsInitialBlockDownload()) && state.vBlocksInFlight.size() < MAX_BLOCKS_IN_TRANSIT_PER_PEER) {
+        if (!m_opts.headers_only && CanServeBlocks(*peer) && ((sync_blocks_and_headers_from_peer && !IsLimitedPeer(*peer)) || !m_chainman.IsInitialBlockDownload()) && state.vBlocksInFlight.size() < MAX_BLOCKS_IN_TRANSIT_PER_PEER) {
             std::vector<const CBlockIndex*> vToDownload;
             NodeId staller = -1;
             auto get_inflight_budget = [&state]() {
